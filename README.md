@@ -1,122 +1,149 @@
-# Model Monitor Template
+# Beatit-AI — Model Monitor (AWS SageMaker Model Monitor)
+
+> **Part of the [Beatit-AI Churn Prediction System](https://github.com/chetnapriyadarshini-iiit)** — a production MLOps system for predicting music streaming subscriber churn on AWS.
+
+This repository implements **automated production monitoring** for the Beatit churn model endpoints using AWS SageMaker Model Monitor — detecting data quality drift, model quality degradation, prediction bias, and feature attribution shifts on both staging and production endpoints.
+
+---
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Monitor Types](#monitor-types)
+- [Architecture](#architecture)
+- [Repository Structure](#repository-structure)
+- [Enabling and Disabling Monitors](#enabling-and-disabling-monitors)
+- [Technologies Used](#technologies-used)
+- [Related Repositories](#related-repositories)
+- [Contact](#contact)
+
+---
 
 ## Overview
 
-The Model Monitor template automates the model monitor setup.
-The template provides the following types of Amazon SageMaker Model Monitor:
+Once a new model version is deployed to a SageMaker endpoint, this monitoring pipeline is automatically triggered when the endpoint status changes to `InService`. It deploys four types of continuous monitors that run on a scheduled basis, comparing live inference data against established baselines to detect degradation before it impacts business outcomes.
 
-- [Monitor Data Quality](https://docs.aws.amazon.com/sagemaker/latest/dg/model-monitor-data-quality.html) -
-  Monitor drift in data quality.
-- [Monitor Model Quality](https://docs.aws.amazon.com/sagemaker/latest/dg/model-monitor-model-quality.html) -
-  Monitor drift in model quality metrics, such as accuracy.
-- [Monitor Bias Drift for Models in Production](https://docs.aws.amazon.com/sagemaker/latest/dg/clarify-model-monitor-bias-drift.html) -
-  Monitor bias in model's predictions.
-- [Monitor Feature Attribution Drift for Models in Production](https://docs.aws.amazon.com/sagemaker/latest/dg/clarify-model-monitor-feature-attribution-drift.html) -
-  Monitor drift in feature attribution.
+Any update to the production endpoint — such as a new model version deployment — re-triggers the monitor pipeline to refresh baselines and configurations automatically.
 
-## Triggering the Model Monitor's CodePipeline
+---
 
-Please note, the execution of the model monitor codepipeline, provisioned by the model build, deploy, and model monitor
-template, will fail the first time because there is no endpoint to monitor yet. Once a model
-is trained, approved, and deployed to an Amazon SageMaker endpoint in the staging environment, the model
-monitor codepipeline will be triggered automatically once the endpoint's status change to `InService`.
+## Monitor Types
 
-Any new updates to the endpoint, such as deploying a new model version, will re-trigger the model monitor
-codepipeline again, to ensure that the monitors use the latests changes, such as new model monitor baselines.
+| Monitor | What It Detects | Business Value |
+|---|---|---|
+| **Data Quality Monitor** | Drift in input feature distributions relative to training baseline | Catches upstream data pipeline changes that could silently degrade predictions |
+| **Model Quality Monitor** | Drift in model performance metrics (e.g. AUC, accuracy) vs. ground truth | Early warning that the model is becoming less accurate in production |
+| **Bias Drift Monitor** (Clarify) | Changes in prediction bias across demographic or feature groups | Ensures fair and consistent predictions across subscriber segments |
+| **Feature Attribution Drift Monitor** (Clarify) | Shifts in which features drive predictions over time | Signals concept drift — the world has changed, the model needs retraining |
 
-## Enabling/Disabling Monitors
+---
 
-By default, all four Amazon SageMaker Model Monitor types are enabled. However, you can
-disable/enable one, or more, monitor's type by setting `"Enable<Monitor-Type>Monitor"` to `"no"`,
-in the [staging-monitoring-schedule-config.json](staging-monitoring-schedule-config.json)
-and [prod-monitoring-schedule-config.json](prod-monitoring-schedule-config.json) files.
+## Architecture
 
 ```
+SageMaker Production Endpoint
+(Status: InService)
+         │
+         ▼ (Auto-triggered)
+  AWS CodePipeline
+         │
+         ▼
+┌────────────────────────────────┐
+│  Build Stage                   │  buildspec.yml
+│  · get_baselines_and_configs.py│  Fetches baselines from
+│  · Retrieve baselines from     │  SageMaker Model Registry
+│    Model Registry              │
+│  · Merge with config files     │
+└───────────────┬────────────────┘
+                │
+                ▼
+┌────────────────────────────────┐
+│  Deploy Monitor Stack          │  model-monitor-template.yml
+│  (CloudFormation)              │  CloudFormation deployment
+│                                │
+│  ┌─────────────────────────┐   │
+│  │ Staging Monitor Schedule│   │  staging-monitoring-schedule-config.json
+│  └─────────────────────────┘   │
+│  ┌─────────────────────────┐   │
+│  │  Prod Monitor Schedule  │   │  prod-monitoring-schedule-config.json
+│  └─────────────────────────┘   │
+└────────────────────────────────┘
+         │  Scheduled runs
+         ▼
+  CloudWatch Alerts on violations
+```
+
+---
+
+## Repository Structure
+
+```
+beatit-ai-model-monitor/
+├── pipelines/                              # Monitor pipeline logic
+├── get_baselines_and_configs.py            # Retrieves baselines from Model Registry
+│                                           # and populates config files
+├── model-monitor-template.yml             # CloudFormation template for all 4 monitors
+├── staging-monitoring-schedule-config.json # Staging monitor configuration
+├── prod-monitoring-schedule-config.json    # Production monitor configuration
+├── utils.py                               # Helper functions
+├── buildspec.yml                          # CodeBuild instructions
+└── __init__.py
+```
+
+---
+
+## Enabling and Disabling Monitors
+
+Each monitor type can be individually enabled or disabled in the configuration files:
+
+```json
 {
   "Parameters": {
-    ...
     "EnableDataQualityMonitor": "yes",
     "EnableModelQualityMonitor": "yes",
     "EnableModelBiasMonitor": "yes",
-    "EnableModelExplainabilityMonitor": "yes",
-    ...
+    "EnableModelExplainabilityMonitor": "yes"
   }
 }
 ```
 
-**Note**: If `ModelQuality` and `ModelBias` monitors are enabled, you need to update the [staging-monitoring-schedule-config.json](staging-monitoring-schedule-config.json) and [prod-monitoring-schedule-config.json](prod-monitoring-schedule-config.json) files, and
-provide your ground truth data's S3 URI. For more information,
-refer to [Ingest Ground Truth Labels and Merge Them With Predictions](https://docs.aws.amazon.com/sagemaker/latest/dg/model-monitor-model-quality-merge.html).
+For `ModelQuality` and `ModelBias` monitors, a ground truth S3 URI must be provided:
 
-```
+```json
 {
   "Parameters": {
-    ...
-    "GroundTruthInput": "",
-    ...
+    "GroundTruthInput": "s3://your-bucket/ground-truth/"
   }
 }
 ```
 
-The template only deploys these monitors if both `"EnableModelQualityMonitor"`/
-`"EnableModelBiasMonitor"` is `"yes"`, and `"GroundTruthInput"` is not an empty string. You can provide the ground truth data later by updating the `"GroundTruthInput"` attribute in the configuration files with data's S3 URI.
+---
 
-### Updating Parameters Specific to the Problem Type
+## Technologies Used
 
-The `ModelQuality`, `ModelBias`, and `ModelExplainability` monitors use one, or more, of
-the following parameters. These parameters depend on the `ProblemType` and your deployed model.
-Only provide a value for the required parameter(s), based on your case, and leave others as empty
-string. For more information, refer to [ModelQualityJobDefinition](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-sagemaker-modelqualityjobdefinition.html),
-[ModelBiasJobDefinition](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-sagemaker-modelbiasjobdefinition.html),
-and [ModelExplainabilityJobDefinition](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-sagemaker-modelexplainabilityjobdefinition.html)
+| Service / Tool | Purpose |
+|---|---|
+| **AWS SageMaker Model Monitor** | Automated scheduled monitoring of production endpoints |
+| **AWS SageMaker Clarify** | Bias detection and feature attribution analysis |
+| **AWS CloudFormation** | Infrastructure-as-code for monitor deployment |
+| **AWS CodePipeline / CodeBuild** | CI/CD trigger and build execution |
+| **Amazon CloudWatch** | Alerting on monitor violations |
+| **SageMaker Model Registry** | Source of training baselines for drift comparison |
+| **Python** | Baseline retrieval and configuration logic |
 
-```
-{
-  "Parameters": {
-    ...
-    "ProblemType": "Regression",
-    "InferenceAttribute": "0",
-    "ProbabilityAttribute": "",
-    "FeaturesAttribute": "",
-    "ProbabilityThresholdAttribute": "",
-    ...
-  }
-}
-```
+---
 
-## Using Custom Baselines/Configuration Files
+## Related Repositories
 
-The template uses baselines and configuration files created by the model building pipeline, and registered in the Amazon SageMaker Model Registry. However, you could provide your baselines/configuration files for one, or more, monitor's type, in the [staging-monitoring-schedule-config.json](staging-monitoring-schedule-config.json) and [prod-monitoring-schedule-config.json](prod-monitoring-schedule-config.json) files, by adding the relevant attributes. If one, or more, attribute is added to the configuration files, the template ignores the baseline(s) returned from the model registry, and uses your custom file(s).
+| Repository | Role |
+|---|---|
+| [beatit-ai-glue-redshift-tables](https://github.com/chetnapriyadarshini-iiit/beatit-ai-glue-redshift-tables) | Upstream data pipeline |
+| [beatit-ai-model-train](https://github.com/chetnapriyadarshini-iiit/beatit-ai-model-train) | Produces training baselines used by this monitor |
+| [beatit-ai-model-deploy](https://github.com/chetnapriyadarshini-iiit/beatit-ai-model-deploy) | Deploys the endpoints monitored here |
+| [beatit_ai_common_utilites](https://github.com/chetnapriyadarshini-iiit/beatit_ai_common_utilites) | Shared utilities |
 
-```
-{
-  "Parameters": {
-    ...
-    "DataQualityConstraintsS3Uri":  "s3://...",
-    "DataQualityStatisticsS3Uri": "s3://...",
-    "ModelQualityConstraintsS3Uri": "s3://...",
-    "ModelBiasConstraintsS3Uri": "s3://...",
-    "ModelBiasConfigS3Uri": "s3://...",
-    "ModelExplainabilityConstraintsS3Uri":
-    "ModelExplainabilityConfigS3Uri": "s3://...",
-    ...
-  }
-}
-```
+---
 
-## Sample Code Layout
+## Contact
 
-This AWS CodeCommit repository is created as part of creating a Project in SageMaker. The sample code is organized as follows:
-
-```
-.
-├── README.md
-├── __init__.py
-├── buildspec.yml                           # used by the AWS CodeBuild project to
-|                                             execute get_baselines_and_configs.py
-├── get_baselines_and_configs.py            # gets baselines/configs files and updates configs files
-├── model-monitor-template.yml              # AWS CloudFormation template to deploy monitors
-├── prod-monitoring-schedule-config.json    # Template parameters for prod environment
-├── staging-monitoring-schedule-config.json # template parameters for staging environment
-└── utils.py                                # helper functions used by get_baselines_and_configs.py
-```
+Created by [@chetnapriyadarshini](https://github.com/chetnapriyadarshini) — feel free to reach out with questions or suggestions.
